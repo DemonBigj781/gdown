@@ -31,7 +31,7 @@ from .parse_url import is_google_drive_url
 # CONFIGURATION CONSTANTS
 # ------------------------------------------------------------------
 MAX_NUMBER_FILES = 1_000_000
-FILE_RETRY_COUNT = 5
+FILE_RETRY_COUNT = 20
 DOWNLOAD_RETRY_SLEEP = 60    # wait 60s between download retries
 SCAN_SLEEP = 2               # wait 2 seconds between folder scans
 
