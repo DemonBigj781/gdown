@@ -1,10 +1,10 @@
 # ============================================================
-# gdown.download_folder (fork-friendly version)
+# gdown.download_folder (fork-friendly, .git-skipping version)
 #
 # Features:
 #   - Uses ThreadPoolExecutor for parallel downloads (workers)
-#   - Skips any files under a `.git` directory
-#   - Retries downloads with backoff
+#   - Skips any `.git` folder (never scanned, never downloaded)
+#   - Retries downloads with a fixed delay
 #   - Backwards-compatible _get_session wrapper
 # ============================================================
 
@@ -30,7 +30,7 @@ from .parse_url import is_google_drive_url
 MAX_NUMBER_FILES = 1_000_000
 
 # Retry config for downloads
-FILE_RETRY_COUNT = 20
+FILE_RETRY_COUNT = 5
 FILE_RETRY_SLEEP = 60  # seconds between retries
 
 GoogleDriveFileToDownload = collections.namedtuple(
@@ -86,7 +86,6 @@ def _parse_google_drive_file(url, content):
             "'Anyone with the link', or have had many accesses. ",
         )
 
-    # decodes the array and evaluates it as a python array
     decoded = encoded_data.encode("utf-8").decode("unicode_escape")
     folder_arr = json.loads(decoded)
 
@@ -143,6 +142,12 @@ def _download_and_parse_google_drive_link(
     )
 
     for child_id, child_name, child_type in id_name_type_iter:
+        # ---- hard skip .git folder so we never scan inside it ----
+        if child_name == ".git":
+            if not quiet:
+                print("Skipping .git folder", child_name, file=sys.stderr)
+            continue
+
         if child_type != _GoogleDriveFile.TYPE_FOLDER:
             gdrive_file.children.append(
                 _GoogleDriveFile(
@@ -269,10 +274,10 @@ def download_folder(
     user_agent=None,
     skip_download=False,
     resume=False,
-    manifest_path=None,  # kept for API compatibility; not used here
+    manifest_path=None,  # unused, kept for API compatibility
     workers=None,
 ):
-    """Downloads entire folder from URL or ID."""
+    """Downloads entire folder from URL."""
     # XOR: exactly one of url or id must be provided
     if not (id is None) ^ (url is None):
         raise ValueError("Either url or id has to be specified")
@@ -318,7 +323,7 @@ def download_folder(
     if not quiet:
         print("Building directory structure completed", file=sys.stderr)
 
-    # Skip any .git paths
+    # Skip any .git paths (safety net on top of scan-level skip)
     directory_structure = [
         (fid, path)
         for (fid, path) in directory_structure
@@ -357,8 +362,8 @@ def download_folder(
         os.makedirs(root_dir)
 
     # Build tasks
-    tasks = []
-    existing_paths = []
+    tasks: List[Dict[str, Any]] = []
+    existing_paths: List[str] = []
 
     for fid, path in directory_structure:
         local_path = osp.join(root_dir, path)
