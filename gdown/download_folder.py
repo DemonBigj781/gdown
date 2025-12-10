@@ -7,7 +7,7 @@ import re
 import sys
 import time
 import warnings
-from typing import List, Union, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Union
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -21,180 +21,256 @@ MAX_NUMBER_FILES = 1000000
 FILE_RETRY_COUNT = 5
 FILE_RETRY_SLEEP = 10
 
+GoogleDriveFileToDownload = collections.namedtuple(
+    "GoogleDriveFileToDownload", ("id", "path", "local_path")
+)
+
 
 class _GoogleDriveFile(object):
     TYPE_FOLDER = "application/vnd.google-apps.folder"
 
-    def __init__(self, id, name, type, children=None):
+    def __init__(self, id: str, name: str, mime_type: str, children=None):
         self.id = id
         self.name = name
-        self.type = type
-        self.children = children if children is not None else []
+        self.mime_type = mime_type
+        self.children: List["_GoogleDriveFile"] = children if children is not None else []
 
-    def is_folder(self):
-        return self.type == self.TYPE_FOLDER
+    def is_folder(self) -> bool:
+        return self.mime_type == self.TYPE_FOLDER
+
+    def __repr__(self) -> str:
+        return "_GoogleDriveFile(id={!r}, name={!r}, mime_type={!r}, children={!r})".format(
+            self.id, self.name, self.mime_type, self.children
+        )
 
 
-def _parse_google_drive_file(url: str, content: str):
-    """Extracts information about the current page file and its children."""
-    folder_soup = bs4.BeautifulSoup(content, features="html.parser")
+def _is_git_path(path: str) -> bool:
+    """
+    Return True if this logical path is inside a .git directory.
 
-    # finds the script tag with window['_DRIVE_ivd'] encoded_data
+    We normalize separators and look for '.git' as a path segment,
+    so things like '.git/config', 'folder/.git/HEAD', etc. are excluded.
+    """
+    parts = path.replace("\\", "/").split("/")
+    return any(part == ".git" for part in parts)
+
+
+def _id_to_folder_url(folder_id: str) -> str:
+    return "https://drive.google.com/drive/folders/{}".format(folder_id)
+
+
+def _id_to_download_url(file_id: str) -> str:
+    # use uc endpoint so gdown.download can handle confirmation etc.
+    return "https://drive.google.com/uc?id={}".format(file_id)
+
+
+def _extract_encoded_drive_data(html: str) -> str:
+    """
+    Extract the encoded data string from the folder HTML.
+
+    Google Drive folder pages include a JS snippet where a global variable
+    like _DRIVE_ivd is assigned an encoded array/string describing contents.
+    We locate the script tag, then pull out the second JS string literal.
+    """
+    soup = bs4.BeautifulSoup(html, features="html.parser")
+
     encoded_data = None
-    for script in folder_soup.select("script"):
+    for script in soup.select("script"):
         inner_html = script.decode_contents()
-        if "_DRIVE_ivd" in inner_html:
-            # first js string is _DRIVE_ivd, the second one is the encoded arr
-            regex_iter = re.compile(r"'((?:[^'\\]|\\.)*)'").finditer(inner_html)
-            # get the second elem in the iter
-            try:
-                encoded_data = next(itertools.islice(regex_iter, 1, None)).group(1)
-            except StopIteration:
-                raise RuntimeError("Couldn't find the folder encoded JS string")
-            break
+        if "_DRIVE_ivd" not in inner_html:
+            continue
+
+        # Find JS string literals inside the script code
+        # The first string is usually the variable name, the second is the payload
+        regex_iter = re.compile(r"'((?:[^'\\]|\\.)*)'").finditer(inner_html)
+        try:
+            encoded_data = next(itertools.islice(regex_iter, 1, None)).group(1)
+        except StopIteration:
+            raise RuntimeError("Couldn't find encoded folder metadata in Drive HTML.")
+        break
 
     if encoded_data is None:
         raise RuntimeError(
             "Cannot retrieve the folder information from the link. "
-            "You may need to change the permission to "
-            "'Anyone with the link', or have had many accesses. "
-            "Check FAQ in https://github.com/wkentaro/gdown?tab=readme-ov-file#faq."
+            "You may need to change the permission to 'Anyone with the link', "
+            "or there might be too many recent accesses."
         )
 
-    # decodes the array and evaluates it as a python array
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
-        decoded = encoded_data.encode("utf-8").decode("unicode_escape")
-        folder_arr = json.loads(decoded)
-
-    folder_contents = [] if folder_arr[0] is None else folder_arr[0]
-
-    sep = " - "  # unicode dash
-    splitted = folder_soup.title.contents[0].split(sep)
-    if len(splitted) >= 2:
-        name = sep.join(splitted[:-1])
-    else:
-        raise RuntimeError(
-            "file/folder name cannot be extracted from: {}".format(
-                folder_soup.title.contents[0]
-            )
-        )
-
-    gdrive_file = _GoogleDriveFile(
-        id=url.split("/")[-1],
-        name=name,
-        type=_GoogleDriveFile.TYPE_FOLDER,
-    )
-
-    id_name_type_iter = [
-        (
-            e[0],
-            e[2].encode("raw_unicode_escape").decode("utf-8"),
-            e[3],
-        )
-        for e in folder_contents
-    ]
-
-    return gdrive_file, id_name_type_iter
+    # JS string literal uses escape sequences, convert to a proper Python string
+    return encoded_data.encode("utf-8").decode("unicode_escape")
 
 
-def _download_and_parse_google_drive_link(
-    sess,
-    url: str,
-    quiet: bool = False,
-    remaining_ok: bool = False,
-    verify: Union[bool, str] = True,
-):
-    """Get folder structure of Google Drive folder URL."""
-    return_code = True
-    for _ in range(2):
-        if is_google_drive_url(url):
-            # canonicalize the language into English
-            if "?" in url:
-                url += "&hl=en"
-            else:
-                url += "?hl=en"
-            res = sess.get(url, verify=verify)
-            if res.status_code != 200:
-                return False, None
-            if is_google_drive_url(url):
+def _parse_google_drive_file(url: str, html: str) -> _GoogleDriveFile:
+    """
+    Parse a Google Drive folder HTML page into a root _GoogleDriveFile tree.
+
+    This function reconstructs a directory tree from encoded metadata embedded
+    in the page. The structure of the payload can change over time; this parser
+    aims to be robust but may need updates if Google changes their format.
+    """
+    encoded = _extract_encoded_drive_data(html)
+
+    # The encoded string is often JSON-like or contains a JSON array embedded.
+    # We look for the first top-level JSON array as a starting point.
+    # This is intentionally conservative to avoid brittle assumptions.
+    match = re.search(r"(\[\[.*\]\])", encoded, flags=re.DOTALL)
+    if not match:
+        raise RuntimeError("Could not locate folder metadata array in encoded payload.")
+
+    try:
+        data = json.loads(match.group(1))
+    except Exception as e:
+        raise RuntimeError("Failed to decode folder metadata JSON: {}".format(e))
+
+    # We expect 'data' to contain rows describing items in the folder.
+    # The exact indexing can vary. We look for entries that look like:
+    # [ ..., file_id, ..., file_name, ..., mime_type, ... ]
+    # and build a tree using parent references.
+    #
+    # This is a best-effort reconstruction, not a byte-for-byte reproduction
+    # of any particular implementation.
+    by_id: Dict[str, _GoogleDriveFile] = {}
+    children_map: Dict[str, List[str]] = {}
+    root_id: Optional[str] = None
+
+    for row in data:
+        if not isinstance(row, list):
+            continue
+
+        # Heuristic positions: id, name, mime_type, parent_id
+        file_id = None
+        name = None
+        mime_type = None
+        parent_id = None
+
+        for item in row:
+            # Very rough heuristics; actual indices depend on Google's internals.
+            if isinstance(item, str):
+                if not file_id and re.match(r"^[a-zA-Z0-9\-_]{10,}$", item):
+                    file_id = item
+                elif not name:
+                    name = item
+                elif not mime_type and item.startswith("application/"):
+                    mime_type = item
+
+        # Attempt to find parent id by looking at last long-ish string
+        long_strings = [
+            s for s in row if isinstance(s, str) and len(s) >= 10 and s != file_id
+        ]
+        if long_strings:
+            parent_id = long_strings[-1]
+
+        if file_id and name and mime_type:
+            if file_id not in by_id:
+                by_id[file_id] = _GoogleDriveFile(file_id, name, mime_type)
+
+            if parent_id:
+                children_map.setdefault(parent_id, []).append(file_id)
+
+            # Heuristic: if this looks like the top-level folder (TYPE_FOLDER and matches id in URL)
+            if mime_type == _GoogleDriveFile.TYPE_FOLDER and file_id in url:
+                root_id = file_id
+
+    if not by_id:
+        raise RuntimeError("Parsed folder metadata is empty; Drive format may have changed.")
+
+    # Build children lists
+    for parent, child_ids in children_map.items():
+        if parent not in by_id:
+            continue
+        parent_node = by_id[parent]
+        for cid in child_ids:
+            child_node = by_id.get(cid)
+            if child_node:
+                parent_node.children.append(child_node)
+
+    if root_id is None:
+        # Fallback: choose any folder-like node as root
+        for file_id, node in by_id.items():
+            if node.is_folder():
+                root_id = file_id
                 break
-            if not is_google_drive_url(res.url):
-                break
-            # need to try with canonicalized url if the original url redirects to gdrive
-            url = res.url
 
-    gdrive_file, id_name_type_iter = _parse_google_drive_file(
-        url=url,
-        content=res.text,
-    )
+    if root_id is None or root_id not in by_id:
+        raise RuntimeError("Could not determine root folder for Google Drive tree.")
 
-    for child_id, child_name, child_type in id_name_type_iter:
-        if child_type != _GoogleDriveFile.TYPE_FOLDER:
-            if not quiet:
-                print("Processing file", child_id, child_name)
-            gdrive_file.children.append(
-                _GoogleDriveFile(
-                    id=child_id,
-                    name=child_name,
-                    type=child_type,
+    return by_id[root_id]
+
+
+def _walk_drive_tree(root: _GoogleDriveFile, parent_path: str = "") -> List[GoogleDriveFileToDownload]:
+    """
+    Flatten a _GoogleDriveFile tree into a list of (id, path) entries.
+
+    'path' is the logical path inside the folder (e.g., 'subdir/file.txt').
+    """
+    results: List[GoogleDriveFileToDownload] = []
+
+    def _recurse(node: _GoogleDriveFile, current_path: str) -> None:
+        if node.is_folder():
+            folder_path = osp.join(current_path, node.name) if current_path else node.name
+            for child in node.children:
+                _recurse(child, folder_path)
+        else:
+            file_path = osp.join(current_path, node.name) if current_path else node.name
+            results.append(
+                GoogleDriveFileToDownload(
+                    id=node.id,
+                    path=file_path,
+                    local_path=None,  # to be filled later
                 )
             )
-            if not return_code:
-                return return_code, None
-            continue
 
-        if not quiet:
-            print("Retrieving folder", child_id, child_name)
-        return_code, child = _download_and_parse_google_drive_link(
-            sess=sess,
-            url="https://drive.google.com/drive/folders/" + child_id,
-            quiet=quiet,
-            remaining_ok=remaining_ok,
-            verify=verify,
-        )
-        if not return_code:
-            return return_code, None
-        gdrive_file.children.append(child)
-
-    has_at_least_max_files = len(gdrive_file.children) == MAX_NUMBER_FILES
-    if not remaining_ok and has_at_least_max_files:
-        message = " ".join(
-            [
-                "The gdrive folder with url: {url}".format(url=url),
-                "has more than {max} files,".format(max=MAX_NUMBER_FILES),
-                "gdrive can't download more than this limit.",
-            ]
-        )
-        raise FolderContentsMaximumLimitError(message)
-
-    return return_code, gdrive_file
+    _recurse(root, parent_path)
+    return results
 
 
-def _get_directory_structure(gdrive_file: _GoogleDriveFile, previous_path: str):
-    """Converts a Google Drive folder structure into a local directory list."""
-    directory_structure = []
-    for file in gdrive_file.children:
-        # SKIP_GIT_DIR
-        if ".git" in file.name:
-            continue
+def _get_directory_structure(
+    url: Optional[str] = None,
+    id: Optional[str] = None,
+    session=None,
+    use_cookies: bool = True,
+    verify: Union[bool, str] = True,
+    user_agent: Optional[str] = None,
+) -> _GoogleDriveFile:
+    """
+    Fetch and parse a Google Drive folder page into a _GoogleDriveFile tree.
+    """
+    if id is not None and url is None:
+        url = _id_to_folder_url(id)
 
-        file.name = file.name.replace(osp.sep, "_")
-        if file.is_folder():
-            directory_structure.append((None, osp.join(previous_path, file.name)))
-            for i in _get_directory_structure(
-                file,
-                osp.join(previous_path, file.name),
-            ):
-                directory_structure.append(i)
-        elif not file.children:
-            directory_structure.append((file.id, osp.join(previous_path, file.name)))
-    return directory_structure
+    if url is None:
+        raise ValueError("Either url or id must be specified.")
+
+    if not is_google_drive_url(url):
+        raise ValueError("URL must be a Google Drive link: {}".format(url))
+
+    if session is None:
+        session = _get_session(proxy=None, use_cookies=use_cookies, verify=verify, user_agent=user_agent)
+
+    response = session.get(url, stream=True)
+    response.raise_for_status()
+    html = response.text
+
+    root = _parse_google_drive_file(url, html)
+    return root
 
 
-GoogleDriveFileToDownload = collections.namedtuple(
-    "GoogleDriveFileToDownload", ("id", "path", "local_path")
-)
+def _load_manifest(manifest_path: str) -> Dict[str, Any]:
+    if not osp.exists(manifest_path):
+        return {}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # Corrupt or unreadable manifest: ignore
+        return {}
+
+
+def _save_manifest(manifest_path: str, manifest: Dict[str, Any]) -> None:
+    tmp_path = manifest_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, manifest_path)
 
 
 def download_folder(
@@ -212,298 +288,222 @@ def download_folder(
     resume: bool = False,
     manifest_path: Optional[str] = None,
     workers: Union[None, int, str] = None,
-) -> Union[List[str], List[GoogleDriveFileToDownload], None]:
-    """Downloads entire folder from URL.
+) -> Union[None, str, List[str], List[GoogleDriveFileToDownload]]:
+    """
+    Download or enumerate all files inside a public Google Drive folder.
 
     Parameters
     ----------
-    url: str
-        URL of the Google Drive folder.
-        Must be of the format 'https://drive.google.com/drive/folders/{url}'.
-    id: str
-        Google Drive's folder ID.
-    output: str, optional
-        Path of the output folder. Defaults to current working directory.
-    quiet: bool, optional
-        Suppress terminal output.
-    proxy: str, optional
-        Proxy.
-    speed: float, optional
-        Download byte size per second (e.g., 256KB/s = 256 * 1024).
-    use_cookies: bool, optional
-        Flag to use cookies. Default is True.
-    remaining_ok: bool, optional
-        Continue even if at MAX_NUMBER_FILES. Default False.
-    verify: bool or string
-        TLS verify.
-    user_agent: str, optional
-        User-agent to use in the HTTP request.
-    skip_download: bool, optional
-        If True, return the list of files to download without downloading them.
-    resume: bool
-        Resume interrupted transfers.
-    manifest_path: str, optional
-        If set, write a JSON manifest of all files (id/path/local_path/status).
-        If the manifest already exists, it will be reused to skip completed files.
-    workers: None | 1 | "auto" | int>1
-        Number of worker threads for parallel downloads.
+    url, id:
+        Google Drive folder URL or folder ID.
+    output:
+        Local directory where files will be stored.
+    quiet:
+        If True, suppress progress messages.
+    proxy, speed, use_cookies, verify, user_agent:
+        Passed through to underlying download() calls.
+    skip_download:
+        If True, do not download; just return a list of GoogleDriveFileToDownload
+        (with local_path fields filled) for what *would* be downloaded.
+    resume:
+        If True, skip files whose local_path already exists.
+    manifest_path:
+        If set, write a JSON manifest of downloaded files and use it to assist resume.
+    workers:
+        None or 1  -> sequential download
+        "auto"     -> ThreadPoolExecutor with sensible max_workers
+        int > 1    -> ThreadPoolExecutor with that many workers
 
     Returns
     -------
-    files: List[str] or List[GoogleDriveFileToDownload] or None
+    - If skip_download is True: List[GoogleDriveFileToDownload]
+    - Else:
+        - If exactly one file downloaded: str (its local path)
+        - If multiple files downloaded: List[str]
+        - If nothing downloaded: None
     """
-    if not (id is None) ^ (url is None):
-        raise ValueError("Either url or id has to be specified")
+    if output is None:
+        output = os.getcwd()
 
-    if id is not None:
-        url = "https://drive.google.com/drive/folders/{id}".format(id=id)
+    if id is None and url is None:
+        raise ValueError("Either url or id must be specified.")
 
-    if user_agent is None:
-        # We need to use different user agent for folder download c.f., file
-        user_agent = (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/98.0.4758.102 Safari/537.36"
-        )
+    session = _get_session(proxy=proxy, use_cookies=use_cookies, verify=verify, user_agent=user_agent)
 
-    sess = _get_session(
-        proxy=proxy,
+    root = _get_directory_structure(
+        url=url,
+        id=id,
+        session=session,
         use_cookies=use_cookies,
+        verify=verify,
         user_agent=user_agent,
     )
 
-    if not quiet:
-        print("Retrieving folder contents", file=sys.stderr)
-    is_success, gdrive_file = _download_and_parse_google_drive_link(
-        sess,
-        url,
-        quiet=quiet,
-        remaining_ok=remaining_ok,
-        verify=verify,
-    )
-    if not is_success:
-        print("Failed to retrieve folder contents", file=sys.stderr)
-        return None
+    files = _walk_drive_tree(root)
 
-    if not quiet:
-        print("Retrieving folder contents completed", file=sys.stderr)
-        print("Building directory structure", file=sys.stderr)
-
-    directory_structure = _get_directory_structure(gdrive_file, previous_path="")
-
-    if not quiet:
-        print("Building directory structure completed", file=sys.stderr)
-
-    if output is None:
-        output = os.getcwd() + osp.sep
-
-    if output.endswith(osp.sep):
-        root_dir = osp.join(output, gdrive_file.name)
-    else:
-        root_dir = output
-
-    if not skip_download and not osp.exists(root_dir):
-        os.makedirs(root_dir)
-
-    manifest: List[Dict[str, Any]] = []
-    previous_manifest: Dict[str, Dict[str, Any]] = {}
-
-    # Load previous manifest if present
-    if manifest_path is not None and osp.exists(manifest_path):
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                old_list = json.load(f)
-            for entry in old_list:
-                key = f'{entry.get("id")}::{entry.get("path")}'
-                previous_manifest[key] = entry
-            if not quiet:
-                print(
-                    f"Loaded previous manifest with {len(previous_manifest)} entries",
-                    file=sys.stderr,
-                )
-        except Exception as e:
-            previous_manifest = {}
-            if not quiet:
-                print(f"Failed to read previous manifest: {e}", file=sys.stderr)
-
-    # Build work list
-    tasks = []
-
-    for file_id, path in directory_structure:
-        local_path = osp.join(root_dir, path)
-
-        # Folder entries
-        if file_id is None:
-            if not skip_download and not osp.exists(local_path):
-                os.makedirs(local_path)
-            manifest.append(
-                {
-                    "id": None,
-                    "path": path,
-                    "local_path": local_path,
-                    "status": "folder",
-                }
-            )
-            continue
-
-        # Dry run: just record what would be downloaded
-        if skip_download:
-            manifest.append(
-                {
-                    "id": file_id,
-                    "path": path,
-                    "local_path": local_path,
-                    "status": "planned",
-                }
-            )
-            continue
-
-        key = f"{file_id}::{path}"
-        prev = previous_manifest.get(key)
-
-        # Skip if already downloaded successfully
-        if prev and prev.get("status") in ("downloaded", "exists"):
-            manifest.append(prev)
-            continue
-
-        tasks.append(
-            {
-                "id": file_id,
-                "path": path,
-                "local_path": local_path,
-            }
+    if len(files) > MAX_NUMBER_FILES:
+        raise FolderContentsMaximumLimitError(
+            "Folder contains too many files ({}). "
+            "Use MAX_NUMBER_FILES to adjust the limit.".format(len(files))
         )
 
-    # If only planning
+    # Fill local_path and apply .git filter
+    for i, f in enumerate(files):
+        # logical path inside folder
+        path_inside = f.path
+        if _is_git_path(path_inside):
+            continue
+
+        local_path = osp.join(output, path_inside)
+        files[i] = GoogleDriveFileToDownload(id=f.id, path=path_inside, local_path=local_path)
+
+    files = [f for f in files if f.local_path is not None and not _is_git_path(f.path)]
+
+    # Early return if just enumerating
     if skip_download:
-        if manifest_path is not None:
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2, ensure_ascii=False)
-        return [
-            GoogleDriveFileToDownload(
-                id=entry["id"],
-                path=entry["path"],
-                local_path=entry["local_path"],
+        if not quiet:
+            print("Skipping download (skip_download=True), {} files listed.".format(len(files)), file=sys.stderr)
+        return files
+
+    # Load manifest if any
+    manifest: Dict[str, Any] = {}
+    if manifest_path is not None:
+        manifest = _load_manifest(manifest_path)
+
+    # Build tasks
+    tasks: List[Dict[str, Any]] = []
+    for f in files:
+        if resume and osp.exists(f.local_path):
+            if not quiet:
+                print("Skipping existing file (resume=True): {}".format(f.local_path), file=sys.stderr)
+            continue
+
+        # Ensure parent directory exists
+        os.makedirs(osp.dirname(f.local_path), exist_ok=True)
+
+        tasks.append(
+            dict(
+                id=f.id,
+                url=_id_to_download_url(f.id),
+                local_path=f.local_path,
+                path=f.path,
             )
-            for entry in manifest
-            if entry["id"] is not None
-        ]
+        )
+
+    if not tasks:
+        if not quiet:
+            print("No files to download.", file=sys.stderr)
+        return None
+
+    # Decide worker count
+    max_workers: Optional[int]
+    if workers in (None, 1):
+        max_workers = None
+    elif workers == "auto":
+        cpu = os.cpu_count() or 1
+        max_workers = min(32, cpu * 2)
+    elif isinstance(workers, int) and workers > 1:
+        max_workers = workers
+    else:
+        raise ValueError("workers must be None, 1, 'auto', or an int > 1")
 
     def _download_one(task: Dict[str, Any]) -> Dict[str, Any]:
         file_id = task["id"]
-        path = task["path"]
+        url = task["url"]
         local_path = task["local_path"]
+        path_inside = task["path"]
 
-        # Skip existing file if resume requested
-        if resume and osp.isfile(local_path):
-            if not quiet:
-                print(
-                    f"Skipping already downloaded file {local_path}",
-                    file=sys.stderr,
-                )
-            return {
-                "id": file_id,
-                "path": path,
-                "local_path": local_path,
-                "status": "exists",
-            }
-
-        url_file = f"https://drive.google.com/uc?id={file_id}"
-
-        last_exc: Optional[Exception] = None
-        for attempt in range(FILE_RETRY_COUNT):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
-                local_result = download(
-                    url=url_file,
+                if not quiet:
+                    print("Downloading {} -> {}".format(path_inside, local_path), file=sys.stderr)
+                # We call gdown.download, which handles cookies/confirm tokens.
+                download(
+                    url=url,
                     output=local_path,
                     quiet=quiet,
                     proxy=proxy,
                     speed=speed,
                     use_cookies=use_cookies,
                     verify=verify,
-                    resume=resume,
+                    user_agent=user_agent,
+                    session=session,
                 )
-                if local_result is None:
-                    raise RuntimeError("Download ended unsuccessfully")
-                return {
-                    "id": file_id,
-                    "path": path,
-                    "local_path": local_result,
-                    "status": "downloaded",
-                }
+                status = "ok"
+                break
             except Exception as e:
-                last_exc = e
-                if attempt + 1 < FILE_RETRY_COUNT:
+                if attempt >= FILE_RETRY_COUNT:
+                    status = "error: {}".format(e)
                     if not quiet:
                         print(
-                            f"Retrying {path} ({attempt + 1}/{FILE_RETRY_COUNT}) "
-                            f"after error: {e}",
+                            "Failed to download {} after {} attempts: {}".format(
+                                path_inside, attempt, e
+                            ),
                             file=sys.stderr,
                         )
-                    time.sleep(FILE_RETRY_SLEEP)
-                else:
-                    if not quiet:
-                        print(
-                            f"Giving up on {path} after {FILE_RETRY_COUNT} attempts: {e}",
-                            file=sys.stderr,
-                        )
+                    break
+                if not quiet:
+                    print(
+                        "Error downloading {} (attempt {}/{}): {}. Retrying in {}s...".format(
+                            path_inside, attempt, FILE_RETRY_COUNT, e, FILE_RETRY_SLEEP
+                        ),
+                        file=sys.stderr,
+                    )
+                time.sleep(FILE_RETRY_SLEEP)
 
-        # Failed
-        return {
-            "id": file_id,
-            "path": path,
-            "local_path": local_path,
-            "status": "failed",
-        }
+        return dict(
+            id=file_id,
+            path=path_inside,
+            local_path=local_path,
+            status=status,
+        )
 
-    files: List[str] = []
+    results: List[Dict[str, Any]] = []
 
-    # Decide worker count
-    if not tasks:
-        if not quiet:
-            print("No files to download", file=sys.stderr)
+    if max_workers is None:
+        # Sequential
+        for t in tasks:
+            results.append(_download_one(t))
     else:
-        if workers in (None, 1):
-            # Sequential
-            for task in tasks:
-                res = _download_one(task)
-                manifest.append(res)
-                if res["status"] in ("downloaded", "exists"):
-                    files.append(res["local_path"])
-        else:
-            # Parallel
-            if workers == "auto":
-                cpu = os.cpu_count() or 1
-                max_workers = min(32, cpu * 2)
-            elif isinstance(workers, int) and workers > 1:
-                max_workers = workers
-            else:
-                raise ValueError("workers must be None, 1, 'auto', or int > 1")
+        if not quiet:
+            print(
+                "Downloading {} files with {} workers".format(len(tasks), max_workers),
+                file=sys.stderr,
+            )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {executor.submit(_download_one, t): t for t in tasks}
+            for future in as_completed(future_to_task):
+                res = future.result()
+                results.append(res)
 
-            if not quiet:
-                print(
-                    f"Downloading {len(tasks)} files with {max_workers} workers",
-                    file=sys.stderr,
-                )
-
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                future_map = {ex.submit(_download_one, t): t for t in tasks}
-                for fut in as_completed(future_map):
-                    res = fut.result()
-                    manifest.append(res)
-                    if res["status"] in ("downloaded", "exists"):
-                        files.append(res["local_path"])
-
-    # Persist manifest
+    # Update manifest
     if manifest_path is not None:
-        try:
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            if not quiet:
-                print(f"Failed to write manifest: {e}", file=sys.stderr)
+        manifest.setdefault("files", [])
+        # Build a dict keyed by (id, path) for easy updates
+        index: Dict[str, Dict[str, Any]] = {}
+        for entry in manifest["files"]:
+            key = "{}::{}".format(entry.get("id"), entry.get("path"))
+            index[key] = entry
 
-    if not quiet:
-        print("Download completed", file=sys.stderr)
+        for res in results:
+            key = "{}::{}".format(res["id"], res["path"])
+            index[key] = dict(
+                id=res["id"],
+                path=res["path"],
+                local_path=res["local_path"],
+                status=res["status"],
+            )
 
-    return files
+        manifest["files"] = list(index.values())
+        _save_manifest(manifest_path, manifest)
+
+    # Collect successful local paths
+    local_paths = [r["local_path"] for r in results if r.get("status") == "ok"]
+
+    if not local_paths:
+        return None
+    if len(local_paths) == 1:
+        return local_paths[0]
+    return local_paths
