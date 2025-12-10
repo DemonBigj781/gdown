@@ -1,11 +1,12 @@
 # ============================================================
-# gdown.download_folder (fork-friendly, .git-skipping version)
+# gdown.download_folder
 #
-# Features:
-#   - Uses ThreadPoolExecutor for parallel downloads (workers)
-#   - Skips any `.git` folder (never scanned, never downloaded)
-#   - Retries downloads with a fixed delay
-#   - Backwards-compatible _get_session wrapper
+# Rebuilt fork-friendly version with:
+#   - ThreadPoolExecutor for parallel downloads (workers)
+#   - .git folders skipped at scan time and before download
+#   - Backwards-compatible _get_session() wrapper
+#   - download() called WITHOUT 'session=' kwarg (old-gdown safe)
+#   - Simple retry logic (20 attempts, 60s between)
 # ============================================================
 
 import collections
@@ -26,12 +27,14 @@ from .download import _get_session, download
 from .exceptions import FolderContentsMaximumLimitError
 from .parse_url import is_google_drive_url
 
-# Max files we’ll accept in a folder
-MAX_NUMBER_FILES = 1_000_000
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
 
-# Retry config for downloads
-FILE_RETRY_COUNT = 5
-FILE_RETRY_SLEEP = 60  # seconds between retries
+MAX_NUMBER_FILES = 1_000_000          # max files allowed in a folder
+FILE_RETRY_COUNT = 20                 # how many times to retry each file
+FILE_RETRY_SLEEP = 60                 # seconds between file retries
+SCAN_SLEEP = 2                        # seconds to sleep before each subfolder scan
 
 GoogleDriveFileToDownload = collections.namedtuple(
     "GoogleDriveFileToDownload", ("id", "path", "local_path")
@@ -43,7 +46,7 @@ GoogleDriveFileToDownload = collections.namedtuple(
 # ----------------------------------------------------------------------
 
 def _is_git_path(path: str) -> bool:
-    """Return True if the path contains a .git directory."""
+    """Return True if the path contains a `.git` directory."""
     parts = path.replace("\\", "/").split("/")
     return any(part == ".git" for part in parts)
 
@@ -61,7 +64,7 @@ class _GoogleDriveFile(object):
         return self.type == self.TYPE_FOLDER
 
 
-def _parse_google_drive_file(url, content):
+def _parse_google_drive_file(url: str, content: str):
     """Extracts information about the current page file and its children."""
     folder_soup = bs4.BeautifulSoup(content, features="html.parser")
 
@@ -83,7 +86,7 @@ def _parse_google_drive_file(url, content):
         raise RuntimeError(
             "Cannot retrieve the folder information from the link. "
             "You may need to change the permission to "
-            "'Anyone with the link', or have had many accesses. ",
+            "'Anyone with the link', or have had many accesses. "
         )
 
     decoded = encoded_data.encode("utf-8").decode("unicode_escape")
@@ -118,10 +121,10 @@ def _parse_google_drive_file(url, content):
 
 def _download_and_parse_google_drive_link(
     sess,
-    url,
-    quiet=False,
-    remaining_ok=False,
-    verify=True,
+    url: str,
+    quiet: bool = False,
+    remaining_ok: bool = False,
+    verify: Union[bool, str] = True,
 ):
     """Get folder structure of Google Drive folder URL."""
     if not is_google_drive_url(url):
@@ -158,10 +161,12 @@ def _download_and_parse_google_drive_link(
             )
             continue
 
-        # Subfolder: recurse
+        # Subfolder: sleep a bit, then recurse
         child_url = "https://drive.google.com/drive/folders/" + child_id
         if not quiet:
             print("Retrieving folder", child_id, child_name, file=sys.stderr)
+
+        time.sleep(SCAN_SLEEP)
 
         ok, child = _download_and_parse_google_drive_link(
             sess=sess,
@@ -190,7 +195,7 @@ def _download_and_parse_google_drive_link(
     return True, gdrive_file
 
 
-def _get_directory_structure(gdrive_file, previous_path):
+def _get_directory_structure(gdrive_file: _GoogleDriveFile, previous_path: str):
     """Converts a Google Drive folder structure into a local directory list."""
     directory_structure = []
     for file in gdrive_file.children:
@@ -262,22 +267,22 @@ def _make_session(
 # ----------------------------------------------------------------------
 
 def download_folder(
-    url=None,
-    id=None,
-    output=None,
-    quiet=False,
-    proxy=None,
-    speed=None,
-    use_cookies=True,
-    remaining_ok=False,
-    verify=True,
-    user_agent=None,
-    skip_download=False,
-    resume=False,
-    manifest_path=None,  # unused, kept for API compatibility
-    workers=None,
+    url: Optional[str] = None,
+    id: Optional[str] = None,
+    output: Optional[str] = None,
+    quiet: bool = False,
+    proxy: Optional[str] = None,
+    speed: Optional[float] = None,
+    use_cookies: bool = True,
+    remaining_ok: bool = False,
+    verify: Union[bool, str] = True,
+    user_agent: Optional[str] = None,
+    skip_download: bool = False,
+    resume: bool = False,
+    manifest_path: Optional[str] = None,  # unused, kept for API compatibility
+    workers: Union[None, int, str] = None,
 ):
-    """Downloads entire folder from URL."""
+    """Downloads entire folder from URL or ID."""
     # XOR: exactly one of url or id must be provided
     if not (id is None) ^ (url is None):
         raise ValueError("Either url or id has to be specified")
@@ -340,7 +345,7 @@ def download_folder(
 
     # If only listing, just return file descriptions
     if skip_download:
-        files_to_return = []
+        files_to_return: List[GoogleDriveFileToDownload] = []
         for fid, path in directory_structure:
             if fid is None:
                 continue
@@ -412,6 +417,9 @@ def download_folder(
     else:
         raise ValueError("workers must be None, 1, 'auto', or an int > 1")
 
+    # ------------------------------------------------------------------
+    # Download worker (NO 'session=' kwarg to download(), for compatibility)
+    # ------------------------------------------------------------------
     def _download_one(task: Dict[str, Any]) -> Dict[str, Any]:
         fid = task["id"]
         path_inside = task["path"]
@@ -438,7 +446,6 @@ def download_folder(
                     verify=verify,
                     resume=resume,
                     user_agent=user_agent,
-                    session=sess,
                 )
 
                 if res is None:
