@@ -6,7 +6,9 @@
 #   - .git folders skipped at scan time and before download
 #   - Backwards-compatible _get_session() wrapper
 #   - download() called WITHOUT 'session=' kwarg (old-gdown safe)
-#   - Simple retry logic (20 attempts, 60s between)
+#   - Simple retry logic:
+#       * folder scans: 20 attempts, 60s between
+#       * file downloads: 20 attempts, 60s between
 # ============================================================
 
 import collections
@@ -32,9 +34,17 @@ from .parse_url import is_google_drive_url
 # ----------------------------------------------------------------------
 
 MAX_NUMBER_FILES = 1_000_000          # max files allowed in a folder
+
+# File download retry config
 FILE_RETRY_COUNT = 20                 # how many times to retry each file
 FILE_RETRY_SLEEP = 60                 # seconds between file retries
-SCAN_SLEEP = 0.2                        # seconds to sleep before each subfolder scan
+
+# Folder scan retry config
+SCAN_RETRY_COUNT = 20                 # how many times to retry each folder scan
+SCAN_RETRY_SLEEP = 60                 # seconds between scan retries
+
+# Optional extra delay before recursing into subfolders
+SCAN_SLEEP_PER_SUBFOLDER = 0.2          # seconds to sleep before each subfolder scan
 
 GoogleDriveFileToDownload = collections.namedtuple(
     "GoogleDriveFileToDownload", ("id", "path", "local_path")
@@ -90,7 +100,12 @@ def _parse_google_drive_file(url: str, content: str):
         )
 
     decoded = encoded_data.encode("utf-8").decode("unicode_escape")
-    folder_arr = json.loads(decoded)
+
+    # JSON can fail if Google returns garbage / partial data → wrap in try/except
+    try:
+        folder_arr = json.loads(decoded)
+    except Exception as e:
+        raise RuntimeError(f"Failed to decode folder JSON: {e}")
 
     folder_contents = [] if folder_arr[0] is None else folder_arr[0]
 
@@ -126,23 +141,54 @@ def _download_and_parse_google_drive_link(
     remaining_ok: bool = False,
     verify: Union[bool, str] = True,
 ):
-    """Get folder structure of Google Drive folder URL."""
+    """
+    Get folder structure of Google Drive folder URL.
+
+    Now has retry logic around the HTTP+JSON parsing, so transient
+    garbage responses (including JSONDecodeError) won't crash the run.
+    """
     if not is_google_drive_url(url):
         raise ValueError("URL must be a Google Drive link")
 
-    # canonicalize the language into English
-    if "?" in url:
-        url_req = url + "&hl=en"
-    else:
-        url_req = url + "?hl=en"
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            # canonicalize the language into English
+            if "?" in url:
+                url_req = url + "&hl=en"
+            else:
+                url_req = url + "?hl=en"
 
-    res = sess.get(url_req, verify=verify)
-    if res.status_code != 200:
-        return False, None
+            res = sess.get(url_req, verify=verify)
+            if res.status_code != 200:
+                raise RuntimeError(f"HTTP {res.status_code} for {url_req}")
 
-    gdrive_file, id_name_type_iter = _parse_google_drive_file(
-        url=url_req, content=res.text
-    )
+            gdrive_file, id_name_type_iter = _parse_google_drive_file(
+                url=url_req, content=res.text
+            )
+            break  # success
+
+        except Exception as e:
+            if attempt >= SCAN_RETRY_COUNT:
+                if not quiet:
+                    print(
+                        "Failed to scan folder {} after {} attempts: {}".format(
+                            url, attempt, e
+                        ),
+                        file=sys.stderr,
+                    )
+                return False, None
+
+            if not quiet:
+                print(
+                    "Error scanning folder {} (attempt {}/{}): {}. "
+                    "Retrying in {}s...".format(
+                        url, attempt, SCAN_RETRY_COUNT, e, SCAN_RETRY_SLEEP
+                    ),
+                    file=sys.stderr,
+                )
+            time.sleep(SCAN_RETRY_SLEEP)
 
     for child_id, child_name, child_type in id_name_type_iter:
         # ---- hard skip .git folder so we never scan inside it ----
@@ -161,12 +207,12 @@ def _download_and_parse_google_drive_link(
             )
             continue
 
-        # Subfolder: sleep a bit, then recurse
+        # Subfolder: optional extra delay, then recurse
         child_url = "https://drive.google.com/drive/folders/" + child_id
         if not quiet:
             print("Retrieving folder", child_id, child_name, file=sys.stderr)
 
-        time.sleep(SCAN_SLEEP)
+        time.sleep(SCAN_SLEEP_PER_SUBFOLDER)
 
         ok, child = _download_and_parse_google_drive_link(
             sess=sess,
