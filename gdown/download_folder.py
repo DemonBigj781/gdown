@@ -1,13 +1,11 @@
 # ============================================================
-# gdown.download_folder
+# gdown.download_folder (fork-friendly version)
 #
-# Patched version with:
-#   - Slow, retrying folder scans (SCAN_RETRY_COUNT + backoff + jitter)
-#   - Slow, retrying downloads (FILE_RETRY_COUNT + backoff + jitter)
-#   - Skip .git folders
-#   - Manifest + resume support
-#   - ThreadPoolExecutor workers
-#   - Backwards-compatible _get_session() call (no verify kwarg issues)
+# Features:
+#   - Uses ThreadPoolExecutor for parallel downloads (workers)
+#   - Skips any files under a `.git` directory
+#   - Retries downloads with backoff
+#   - Backwards-compatible _get_session wrapper
 # ============================================================
 
 import collections
@@ -18,8 +16,6 @@ import os.path as osp
 import re
 import sys
 import time
-import warnings
-import random
 from typing import Any, Dict, List, Optional, Union
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,36 +26,21 @@ from .download import _get_session, download
 from .exceptions import FolderContentsMaximumLimitError
 from .parse_url import is_google_drive_url
 
-# ------------------------------------------------------------------
-# CONFIGURATION CONSTANTS
-# ------------------------------------------------------------------
+# Max files we’ll accept in a folder
 MAX_NUMBER_FILES = 1_000_000
 
-# How many times to retry a *file download*
+# Retry config for downloads
 FILE_RETRY_COUNT = 20
-
-# How many times to retry a *folder scan* (HTML / _DRIVE_ivd parse)
-SCAN_RETRY_COUNT = 20
-
-# Base waits in seconds
-DOWNLOAD_BASE_SLEEP = 60    # base wait between download retries
-SCAN_BASE_SLEEP = 60        # base wait between scan retries
-
-# Caps in seconds (for exponential-ish backoff)
-DOWNLOAD_MAX_SLEEP = 300    # cap download wait at 5 minutes
-SCAN_MAX_SLEEP = 300        # cap scan wait at 5 minutes
-
-# Jitter fraction (±20%)
-JITTER_FRACTION = 0.2
+FILE_RETRY_SLEEP = 60  # seconds between retries
 
 GoogleDriveFileToDownload = collections.namedtuple(
     "GoogleDriveFileToDownload", ("id", "path", "local_path")
 )
 
 
-# ------------------------------------------------------------------
-# HELPERS
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
 
 def _is_git_path(path: str) -> bool:
     """Return True if the path contains a .git directory."""
@@ -67,39 +48,7 @@ def _is_git_path(path: str) -> bool:
     return any(part == ".git" for part in parts)
 
 
-def _sleep_with_backoff(
-    base: int,
-    attempt: int,
-    max_sleep: int,
-    what: str,
-    quiet: bool = False,
-) -> None:
-    """
-    Sleep with increasing backoff and random jitter.
-
-    - base: base wait (e.g., 60s)
-    - attempt: 1-based retry attempt index
-    - max_sleep: cap in seconds
-    - what: label for logging ("SCAN" or "DOWNLOAD")
-    """
-    # simple linear-ish backoff: base + (attempt-1)*30, capped
-    wait = min(base + (attempt - 1) * 30, max_sleep)
-
-    # apply ±20% jitter
-    jitter_scale = 1.0 + random.uniform(-JITTER_FRACTION, JITTER_FRACTION)
-    wait_jittered = max(5, int(wait * jitter_scale))  # never less than 5s
-
-    if not quiet:
-        print(
-            f"[{what}] Backoff sleeping {wait_jittered}s (base={base}, "
-            f"attempt={attempt}, raw_wait={wait})",
-            file=sys.stderr,
-        )
-
-    time.sleep(wait_jittered)
-
-
-class _GoogleDriveFile:
+class _GoogleDriveFile(object):
     TYPE_FOLDER = "application/vnd.google-apps.folder"
 
     def __init__(self, id, name, type, children=None):
@@ -112,42 +61,49 @@ class _GoogleDriveFile:
         return self.type == self.TYPE_FOLDER
 
 
-# ------------------------------------------------------------------
-# Parsing the folder HTML
-# ------------------------------------------------------------------
+def _parse_google_drive_file(url, content):
+    """Extracts information about the current page file and its children."""
+    folder_soup = bs4.BeautifulSoup(content, features="html.parser")
 
-def _parse_google_drive_file(url: str, content: str):
-    """Parse folder HTML and extract child files/folders."""
-    soup = bs4.BeautifulSoup(content, features="html.parser")
-
+    # finds the script tag with window['_DRIVE_ivd'] encoded_data
     encoded_data = None
-    for script in soup.select("script"):
+    for script in folder_soup.select("script"):
         inner_html = script.decode_contents()
         if "_DRIVE_ivd" in inner_html:
+            # first js string is _DRIVE_ivd, the second one is the encoded arr
             regex_iter = re.compile(r"'((?:[^'\\]|\\.)*)'").finditer(inner_html)
+            # get the second elem in the iter
             try:
                 encoded_data = next(itertools.islice(regex_iter, 1, None)).group(1)
             except StopIteration:
-                raise RuntimeError("Could not find encoded folder metadata")
+                raise RuntimeError("Couldn't find the folder encoded JS string")
             break
 
     if encoded_data is None:
         raise RuntimeError(
-            "Cannot retrieve folder metadata (Drive returned incomplete page)."
+            "Cannot retrieve the folder information from the link. "
+            "You may need to change the permission to "
+            "'Anyone with the link', or have had many accesses. ",
         )
 
+    # decodes the array and evaluates it as a python array
     decoded = encoded_data.encode("utf-8").decode("unicode_escape")
-    arr = json.loads(decoded)
+    folder_arr = json.loads(decoded)
 
-    folder_contents = arr[0] if arr and arr[0] else []
+    folder_contents = [] if folder_arr[0] is None else folder_arr[0]
 
-    title = soup.title.contents[0]
-    if " - " in title:
-        name = title.rsplit(" - ", 1)[0]
+    sep = " - "
+    splitted = folder_soup.title.contents[0].split(sep)
+    if len(splitted) >= 2:
+        name = sep.join(splitted[:-1])
     else:
-        name = "folder"
+        raise RuntimeError(
+            "file/folder name cannot be extracted from: {}".format(
+                folder_soup.title.contents[0]
+            )
+        )
 
-    root = _GoogleDriveFile(
+    gdrive_file = _GoogleDriveFile(
         id=url.split("/")[-1],
         name=name,
         type=_GoogleDriveFile.TYPE_FOLDER,
@@ -157,22 +113,22 @@ def _parse_google_drive_file(url: str, content: str):
         (e[0], e[2].encode("raw_unicode_escape").decode("utf-8"), e[3])
         for e in folder_contents
     ]
-    return root, id_name_type_iter
+
+    return gdrive_file, id_name_type_iter
 
 
-def _scan_folder_once(
+def _download_and_parse_google_drive_link(
     sess,
-    url: str,
-    quiet: bool,
-    remaining_ok: bool,
-    verify: Union[bool, str],
+    url,
+    quiet=False,
+    remaining_ok=False,
+    verify=True,
 ):
-    """
-    Perform a single HTTP+parse attempt for a given folder URL.
+    """Get folder structure of Google Drive folder URL."""
+    if not is_google_drive_url(url):
+        raise ValueError("URL must be a Google Drive link")
 
-    Raises on parse errors; caller is responsible for retry/backoff.
-    """
-    # Ensure English language to keep HTML more consistent
+    # canonicalize the language into English
     if "?" in url:
         url_req = url + "&hl=en"
     else:
@@ -180,146 +136,81 @@ def _scan_folder_once(
 
     res = sess.get(url_req, verify=verify)
     if res.status_code != 200:
-        raise RuntimeError(f"HTTP {res.status_code} while fetching {url_req}")
+        return False, None
 
-    root, entries = _parse_google_drive_file(url_req, res.text)
+    gdrive_file, id_name_type_iter = _parse_google_drive_file(
+        url=url_req, content=res.text
+    )
 
-    if len(entries) == MAX_NUMBER_FILES and not remaining_ok:
-        raise FolderContentsMaximumLimitError(
-            "Folder contains more than permitted MAX_NUMBER_FILES"
-        )
-
-    return root, entries
-
-
-def _download_and_parse_google_drive_link(
-    sess,
-    url: str,
-    quiet: bool = False,
-    remaining_ok: bool = False,
-    verify: Union[bool, str] = True,
-    _depth: int = 0,
-):
-    """
-    Recursively scan Google Drive folder structure with retries and backoff.
-
-    Returns (success: bool, root: _GoogleDriveFile or None)
-    """
-
-    indent = "  " * _depth
-    if not quiet:
-        print(f"{indent}[SCAN] Fetching folder: {url}", file=sys.stderr)
-
-    # Retry loop around the HTML/parse step
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            root, entries = _scan_folder_once(sess, url, quiet, remaining_ok, verify)
-            break
-        except Exception as e:
-            if attempt >= SCAN_RETRY_COUNT:
-                if not quiet:
-                    print(
-                        f"{indent}[SCAN] Giving up after {attempt} attempts: {e}",
-                        file=sys.stderr,
-                    )
-                return False, None
-
-            if not quiet:
-                print(
-                    f"{indent}[SCAN] Error scanning folder (attempt "
-                    f"{attempt}/{SCAN_RETRY_COUNT}): {e}",
-                    file=sys.stderr,
-                )
-
-            _sleep_with_backoff(
-                base=SCAN_BASE_SLEEP,
-                attempt=attempt,
-                max_sleep=SCAN_MAX_SLEEP,
-                what="SCAN",
-                quiet=quiet,
-            )
-
-    # Recurse into subfolders (each call has its own retry+backoff)
-    for child_id, child_name, child_type in entries:
+    for child_id, child_name, child_type in id_name_type_iter:
         if child_type != _GoogleDriveFile.TYPE_FOLDER:
-            root.children.append(
-                _GoogleDriveFile(id=child_id, name=child_name, type=child_type)
+            gdrive_file.children.append(
+                _GoogleDriveFile(
+                    id=child_id,
+                    name=child_name,
+                    type=child_type,
+                )
             )
             continue
 
-        sub_url = "https://drive.google.com/drive/folders/" + child_id
+        # Subfolder: recurse
+        child_url = "https://drive.google.com/drive/folders/" + child_id
         if not quiet:
-            print(f"{indent}[SCAN] Entering subfolder: {child_name}", file=sys.stderr)
+            print("Retrieving folder", child_id, child_name, file=sys.stderr)
 
         ok, child = _download_and_parse_google_drive_link(
             sess=sess,
-            url=sub_url,
+            url=child_url,
             quiet=quiet,
             remaining_ok=remaining_ok,
             verify=verify,
-            _depth=_depth + 1,
         )
 
         if not ok:
-            return False, None
+            return ok, None
 
-        root.children.append(child)
+        gdrive_file.children.append(child)
 
-    return True, root
+    has_at_least_max_files = len(gdrive_file.children) == MAX_NUMBER_FILES
+    if not remaining_ok and has_at_least_max_files:
+        message = " ".join(
+            [
+                "The gdrive folder with url: {url}".format(url=url),
+                "has more than {max} files,".format(max=MAX_NUMBER_FILES),
+                "gdown can't download more than this limit.",
+            ]
+        )
+        raise FolderContentsMaximumLimitError(message)
 
-
-# ------------------------------------------------------------------
-# Flattening directory tree
-# ------------------------------------------------------------------
-
-def _get_directory_structure(root: _GoogleDriveFile, base: str = ""):
-    """Flatten a GoogleDriveFile tree into (id, path) pairs."""
-    out = []
-    for child in root.children:
-        safe_name = child.name.replace(os.sep, "_")
-        new_path = osp.join(base, safe_name)
-
-        if child.is_folder():
-            out.append((None, new_path))
-            out.extend(_get_directory_structure(child, new_path))
-        else:
-            out.append((child.id, new_path))
-
-    return out
+    return True, gdrive_file
 
 
-# ------------------------------------------------------------------
-# Manifest helpers
-# ------------------------------------------------------------------
-
-def _load_manifest(path: Optional[str]) -> Dict[str, Any]:
-    if not path or not osp.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_manifest(path: str, data: Dict[str, Any]) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+def _get_directory_structure(gdrive_file, previous_path):
+    """Converts a Google Drive folder structure into a local directory list."""
+    directory_structure = []
+    for file in gdrive_file.children:
+        # avoid path separator inside file names
+        file.name = file.name.replace(osp.sep, "_")
+        if file.is_folder():
+            directory_structure.append((None, osp.join(previous_path, file.name)))
+            for i in _get_directory_structure(
+                file, osp.join(previous_path, file.name)
+            ):
+                directory_structure.append(i)
+        elif not file.children:
+            directory_structure.append((file.id, osp.join(previous_path, file.name)))
+    return directory_structure
 
 
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Backwards-compatible _get_session wrapper
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 def _make_session(
-    proxy: Optional[str],
-    use_cookies: bool,
-    user_agent: Optional[str],
-    verify: Union[bool, str],
+    proxy,
+    use_cookies,
+    user_agent,
+    verify,
 ):
     """
     Call _get_session() in a way that's compatible with multiple gdown versions.
@@ -361,34 +252,33 @@ def _make_session(
     return _get_session()
 
 
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Main download_folder
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 def download_folder(
-    url: Optional[str] = None,
-    id: Optional[str] = None,
-    output: Optional[str] = None,
-    quiet: bool = False,
-    proxy: Optional[str] = None,
-    speed: Optional[float] = None,
-    use_cookies: bool = True,
-    remaining_ok: bool = False,
-    verify: Union[bool, str] = True,
-    user_agent: Optional[str] = None,
-    skip_download: bool = False,
-    resume: bool = False,
-    manifest_path: Optional[str] = None,
-    workers: Union[None, int, str] = None,
-) -> Union[List[str], List[GoogleDriveFileToDownload], None]:
-    """Download or enumerate entire Google Drive folder."""
+    url=None,
+    id=None,
+    output=None,
+    quiet=False,
+    proxy=None,
+    speed=None,
+    use_cookies=True,
+    remaining_ok=False,
+    verify=True,
+    user_agent=None,
+    skip_download=False,
+    resume=False,
+    manifest_path=None,  # kept for API compatibility; not used here
+    workers=None,
+):
+    """Downloads entire folder from URL or ID."""
+    # XOR: exactly one of url or id must be provided
+    if not (id is None) ^ (url is None):
+        raise ValueError("Either url or id has to be specified")
 
-    if not (url or id):
-        raise ValueError("Either 'url' or 'id' must be provided")
-
-    # Normalize URL
-    if id and not url:
-        url = f"https://drive.google.com/drive/folders/{id}"
+    if id is not None:
+        url = "https://drive.google.com/drive/folders/{id}".format(id=id)
 
     if user_agent is None:
         user_agent = (
@@ -397,7 +287,6 @@ def download_folder(
             "Chrome/120 Safari/537.36"
         )
 
-    # Use compatibility wrapper instead of calling _get_session directly
     sess = _make_session(
         proxy=proxy,
         use_cookies=use_cookies,
@@ -406,76 +295,108 @@ def download_folder(
     )
 
     if not quiet:
-        print("[SCAN] Starting folder enumeration", file=sys.stderr)
+        print("Retrieving folder contents", file=sys.stderr)
 
-    ok, root = _download_and_parse_google_drive_link(
-        sess=sess,
-        url=url,
+    is_success, gdrive_file = _download_and_parse_google_drive_link(
+        sess,
+        url,
         quiet=quiet,
         remaining_ok=remaining_ok,
         verify=verify,
     )
 
-    if not ok or root is None:
-        if not quiet:
-            print("[SCAN] Failed to retrieve folder structure.", file=sys.stderr)
+    if not is_success:
+        print("Failed to retrieve folder contents", file=sys.stderr)
         return None
 
-    structure = _get_directory_structure(root)
+    if not quiet:
+        print("Retrieving folder contents completed", file=sys.stderr)
+        print("Building directory structure", file=sys.stderr)
 
-    # Skip .git paths
-    structure = [(fid, p) for fid, p in structure if not _is_git_path(p)]
+    directory_structure = _get_directory_structure(gdrive_file, previous_path="")
 
-    # Listing-only mode
+    if not quiet:
+        print("Building directory structure completed", file=sys.stderr)
+
+    # Skip any .git paths
+    directory_structure = [
+        (fid, path)
+        for (fid, path) in directory_structure
+        if not _is_git_path(path)
+    ]
+
+    if output is None:
+        output = os.getcwd() + osp.sep
+
+    if output.endswith(osp.sep):
+        root_dir = osp.join(output, gdrive_file.name)
+    else:
+        root_dir = output
+
+    # If only listing, just return file descriptions
     if skip_download:
-        base_out = output or os.getcwd()
-        listed: List[GoogleDriveFileToDownload] = []
-        for fid, path in structure:
+        files_to_return = []
+        for fid, path in directory_structure:
             if fid is None:
                 continue
-            local_path = osp.join(base_out, root.name, path)
-            listed.append(GoogleDriveFileToDownload(fid, path, local_path))
+            local_path = osp.join(root_dir, path)
+            files_to_return.append(
+                GoogleDriveFileToDownload(id=fid, path=path, local_path=local_path)
+            )
         if not quiet:
-            print(f"[LIST] {len(listed)} files (skip_download=True)", file=sys.stderr)
-        return listed
+            print(
+                "Skipping download (skip_download=True), {} files listed.".format(
+                    len(files_to_return)
+                ),
+                file=sys.stderr,
+            )
+        return files_to_return
 
-    # Build download tasks
-    base_out = output or os.getcwd()
-    root_out = osp.join(base_out, root.name)
+    # Actually download
+    if not osp.exists(root_dir):
+        os.makedirs(root_dir)
 
-    tasks: List[Dict[str, Any]] = []
-    existing_paths: List[str] = []
+    # Build tasks
+    tasks = []
+    existing_paths = []
 
-    for fid, rel_path in structure:
-        local_path = osp.join(root_out, rel_path)
+    for fid, path in directory_structure:
+        local_path = osp.join(root_dir, path)
 
         if fid is None:
-            os.makedirs(local_path, exist_ok=True)
+            if not osp.exists(local_path):
+                os.makedirs(local_path)
             continue
 
-        if resume and osp.exists(local_path):
+        # resume skip
+        if resume and osp.isfile(local_path):
             if not quiet:
-                print(f"[RESUME] Skipping existing file: {local_path}", file=sys.stderr)
+                print(
+                    "Skipping already downloaded file {}".format(local_path),
+                    file=sys.stderr,
+                )
             existing_paths.append(local_path)
             continue
 
-        os.makedirs(osp.dirname(local_path), exist_ok=True)
+        parent_dir = osp.dirname(local_path)
+        if parent_dir and not osp.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
 
         tasks.append(
             dict(
                 id=fid,
-                path=rel_path,
+                path=path,
                 local_path=local_path,
-                url=f"https://drive.google.com/uc?id={fid}",
+                url="https://drive.google.com/uc?id=" + fid,
             )
         )
 
     if not tasks and not existing_paths:
         if not quiet:
-            print("[DL] No files to download.", file=sys.stderr)
+            print("No files to download.", file=sys.stderr)
         return None
 
-    # Decide worker count
+    # Decide workers
     if workers in (None, 1):
         max_workers = None
     elif workers == "auto":
@@ -486,16 +407,9 @@ def download_folder(
     else:
         raise ValueError("workers must be None, 1, 'auto', or an int > 1")
 
-    # Manifest
-    manifest = _load_manifest(manifest_path)
-    manifest.setdefault("files", [])
-
-    # ------------------------------------------------------------------
-    # Download worker with backoff & jitter
-    # ------------------------------------------------------------------
     def _download_one(task: Dict[str, Any]) -> Dict[str, Any]:
         fid = task["id"]
-        rel = task["path"]
+        path_inside = task["path"]
         local_path = task["local_path"]
         url_dl = task["url"]
 
@@ -504,7 +418,10 @@ def download_folder(
             attempt += 1
             try:
                 if not quiet:
-                    print(f"[DL] {rel} -> {local_path}", file=sys.stderr)
+                    print(
+                        "Downloading {} -> {}".format(path_inside, local_path),
+                        file=sys.stderr,
+                    )
 
                 res = download(
                     url=url_dl,
@@ -520,47 +437,44 @@ def download_folder(
                 )
 
                 if res is None:
-                    raise RuntimeError("Drive returned empty response")
+                    raise RuntimeError("Download ended unsuccessfully (None returned)")
 
-                return dict(
-                    id=fid,
-                    path=rel,
-                    local_path=local_path,
-                    status="ok",
-                )
+                status = "ok"
+                break
 
             except Exception as e:
                 if attempt >= FILE_RETRY_COUNT:
+                    status = "error: {}".format(e)
                     if not quiet:
                         print(
-                            f"[DL] Giving up on {rel} after {attempt} attempts: {e}",
+                            "Failed to download {} after {} attempts: {}".format(
+                                path_inside, attempt, e
+                            ),
                             file=sys.stderr,
                         )
-                    return dict(
-                        id=fid,
-                        path=rel,
-                        local_path=local_path,
-                        status=f"error: {e}",
-                    )
+                    break
 
                 if not quiet:
                     print(
-                        f"[DL] Error downloading {rel} (attempt "
-                        f"{attempt}/{FILE_RETRY_COUNT}): {e}",
+                        "Error downloading {} (attempt {}/{}): {}. "
+                        "Retrying in {}s...".format(
+                            path_inside,
+                            attempt,
+                            FILE_RETRY_COUNT,
+                            e,
+                            FILE_RETRY_SLEEP,
+                        ),
                         file=sys.stderr,
                     )
+                time.sleep(FILE_RETRY_SLEEP)
 
-                _sleep_with_backoff(
-                    base=DOWNLOAD_BASE_SLEEP,
-                    attempt=attempt,
-                    max_sleep=DOWNLOAD_MAX_SLEEP,
-                    what="DOWNLOAD",
-                    quiet=quiet,
-                )
+        return dict(
+            id=fid,
+            path=path_inside,
+            local_path=local_path,
+            status=status,
+        )
 
-    # ------------------------------------------------------------------
-    # Execute downloads
-    # ------------------------------------------------------------------
     results: List[Dict[str, Any]] = []
 
     if max_workers is None:
@@ -569,34 +483,17 @@ def download_folder(
     else:
         if not quiet:
             print(
-                f"[DL] Downloading {len(tasks)} files with {max_workers} workers",
+                "Downloading {} files with {} workers".format(
+                    len(tasks), max_workers
+                ),
                 file=sys.stderr,
             )
-        with ThreadPoolExecutor(max_workers=max_workers) as exe:
-            future_map = {exe.submit(_download_one, t): t for t in tasks}
-            for fut in as_completed(future_map):
-                results.append(fut.result())
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {executor.submit(_download_one, t): t for t in tasks}
+            for future in as_completed(future_to_task):
+                results.append(future.result())
 
-    # Update manifest
-    if manifest_path:
-        index: Dict[str, Dict[str, Any]] = {}
-        for entry in manifest.get("files", []):
-            key = f"{entry.get('id')}::{entry.get('path')}"
-            index[key] = entry
-
-        for r in results:
-            key = f"{r['id']}::{r['path']}"
-            index[key] = dict(
-                id=r["id"],
-                path=r["path"],
-                local_path=r["local_path"],
-                status=r["status"],
-            )
-
-        manifest["files"] = list(index.values())
-        _save_manifest(manifest_path, manifest)
-
-    # Collect OK + resumed paths
+    # Collect local paths
     local_paths = list(existing_paths)
     local_paths.extend(
         [r["local_path"] for r in results if r.get("status") == "ok"]
