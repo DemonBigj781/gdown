@@ -408,102 +408,77 @@ def download_folder(
         raise ValueError("workers must be None, 1, 'auto', or an int > 1")
 
     def _download_one(task: Dict[str, Any]) -> Dict[str, Any]:
-        file_id = task["id"]
-        url = task["url"]
-        local_path = task["local_path"]
-        path_inside = task["path"]
+    file_id = task["id"]
+    url = task["url"]
+    local_path = task["local_path"]
+    path_inside = task["path"]
 
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                if not quiet:
-                    print("Downloading {} -> {}".format(path_inside, local_path), file=sys.stderr)
-                # We call gdown.download, which handles cookies/confirm tokens.
-                download(
-                    url=url,
-                    output=local_path,
-                    quiet=quiet,
-                    proxy=proxy,
-                    speed=speed,
-                    use_cookies=use_cookies,
-                    verify=verify,
-                    user_agent=user_agent,
-                    session=session,
-                )
-                status = "ok"
-                break
-            except Exception as e:
-                if attempt >= FILE_RETRY_COUNT:
-                    status = "error: {}".format(e)
-                    if not quiet:
-                        print(
-                            "Failed to download {} after {} attempts: {}".format(
-                                path_inside, attempt, e
-                            ),
-                            file=sys.stderr,
-                        )
-                    break
+    RATE_LIMIT_SLEEP = 60  # seconds to wait when rate-limited
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            if not quiet:
+                print(f"Downloading {path_inside} -> {local_path}", file=sys.stderr)
+
+            download(
+                url=url,
+                output=local_path,
+                quiet=quiet,
+                proxy=proxy,
+                speed=speed,
+                use_cookies=use_cookies,
+                verify=verify,
+                user_agent=user_agent,
+                session=session,
+            )
+
+            status = "ok"
+            break
+
+        except Exception as e:
+            msg = str(e).lower()
+
+            # --- Detect common Google Drive rate limit signals ---
+            rate_limited = (
+                "rate" in msg
+                or "quota" in msg
+                or "403" in msg
+                or "429" in msg
+                or "too many" in msg
+                or "userRateLimitExceeded" in msg
+            )
+
+            if attempt >= FILE_RETRY_COUNT:
+                status = f"error: {e}"
                 if not quiet:
                     print(
-                        "Error downloading {} (attempt {}/{}): {}. Retrying in {}s...".format(
-                            path_inside, attempt, FILE_RETRY_COUNT, e, FILE_RETRY_SLEEP
-                        ),
+                        f"Failed to download {path_inside} after {attempt} attempts: {e}",
+                        file=sys.stderr,
+                    )
+                break
+
+            if rate_limited:
+                if not quiet:
+                    print(
+                        f"[Rate limited] {path_inside} -> waiting {RATE_LIMIT_SLEEP}s before retry "
+                        f"({attempt}/{FILE_RETRY_COUNT})",
+                        file=sys.stderr,
+                    )
+                time.sleep(RATE_LIMIT_SLEEP)
+            else:
+                if not quiet:
+                    print(
+                        f"Error downloading {path_inside} (attempt {attempt}/{FILE_RETRY_COUNT}): {e}. "
+                        f"Retrying in {FILE_RETRY_SLEEP}s...",
                         file=sys.stderr,
                     )
                 time.sleep(FILE_RETRY_SLEEP)
 
-        return dict(
-            id=file_id,
-            path=path_inside,
-            local_path=local_path,
-            status=status,
-        )
-
-    results: List[Dict[str, Any]] = []
-
-    if max_workers is None:
-        # Sequential
-        for t in tasks:
-            results.append(_download_one(t))
-    else:
-        if not quiet:
-            print(
-                "Downloading {} files with {} workers".format(len(tasks), max_workers),
-                file=sys.stderr,
-            )
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_task = {executor.submit(_download_one, t): t for t in tasks}
-            for future in as_completed(future_to_task):
-                res = future.result()
-                results.append(res)
-
-    # Update manifest
-    if manifest_path is not None:
-        manifest.setdefault("files", [])
-        # Build a dict keyed by (id, path) for easy updates
-        index: Dict[str, Dict[str, Any]] = {}
-        for entry in manifest["files"]:
-            key = "{}::{}".format(entry.get("id"), entry.get("path"))
-            index[key] = entry
-
-        for res in results:
-            key = "{}::{}".format(res["id"], res["path"])
-            index[key] = dict(
-                id=res["id"],
-                path=res["path"],
-                local_path=res["local_path"],
-                status=res["status"],
-            )
-
-        manifest["files"] = list(index.values())
-        _save_manifest(manifest_path, manifest)
-
-    # Collect successful local paths
-    local_paths = [r["local_path"] for r in results if r.get("status") == "ok"]
-
-    if not local_paths:
-        return None
-    if len(local_paths) == 1:
-        return local_paths[0]
-    return local_paths
+    return dict(
+        id=file_id,
+        path=path_inside,
+        local_path=local_path,
+        status=status,
+    )
