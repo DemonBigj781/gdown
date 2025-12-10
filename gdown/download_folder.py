@@ -34,7 +34,7 @@ from .parse_url import is_google_drive_url
 MAX_NUMBER_FILES = 1_000_000          # max files allowed in a folder
 FILE_RETRY_COUNT = 20                 # how many times to retry each file
 FILE_RETRY_SLEEP = 60                 # seconds between file retries
-SCAN_SLEEP = 0.5                        # seconds to sleep before each subfolder scan
+SCAN_SLEEP = 0.2                        # seconds to sleep before each subfolder scan
 
 GoogleDriveFileToDownload = collections.namedtuple(
     "GoogleDriveFileToDownload", ("id", "path", "local_path")
